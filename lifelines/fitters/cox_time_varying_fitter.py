@@ -2,16 +2,18 @@
 
 
 from datetime import datetime
+from typing import Union, Optional, List
 import warnings
 import time
-from typing import Optional
 
 import numpy as np
 import pandas as pd
+from pandas import DataFrame, Series, Index
 from scipy import stats
 
 from numpy.linalg import norm, inv
 from numpy import sum as array_sum_to_scalar
+from numpy import ndarray, exp
 
 from scipy.linalg import solve as spsolve, LinAlgError
 
@@ -77,7 +79,7 @@ class CoxTimeVaryingFitter(SemiParametricRegressionFitter, ProportionalHazardMix
         The event_observed variable provided
     variance_matrix_ : DataFrame
         The variance matrix of the coefficients
-    strata: list | str
+    strata: list
         the strata provided
     standard_errors_: Series
         the standard errors of the estimates
@@ -91,7 +93,7 @@ class CoxTimeVaryingFitter(SemiParametricRegressionFitter, ProportionalHazardMix
         super(CoxTimeVaryingFitter, self).__init__(alpha=alpha)
         self.alpha = alpha
         self.penalizer = penalizer
-        self.strata = utils._to_list_or_singleton(strata)
+        self.strata = strata
         self.l1_ratio = l1_ratio
 
     def fit(
@@ -103,11 +105,11 @@ class CoxTimeVaryingFitter(SemiParametricRegressionFitter, ProportionalHazardMix
         weights_col=None,
         id_col=None,
         show_progress=False,
+        step_size=0.95,
         robust=False,
         strata=None,
         initial_point=None,
         formula: str = None,
-        fit_options: Optional[dict] = None,
     ):  # pylint: disable=too-many-arguments
         """
         Fit the Cox Proportional Hazard model to a time varying dataset. Tied survival times
@@ -139,7 +141,9 @@ class CoxTimeVaryingFitter(SemiParametricRegressionFitter, ProportionalHazardMix
             Compute the robust errors using the Huber sandwich estimator, aka Wei-Lin estimate. This does not handle
           ties, so if there are high number of ties, results may significantly differ. See
           "The Robust Inference for the Cox Proportional Hazards Model", Journal of the American Statistical Association, Vol. 84, No. 408 (Dec., 1989), pp. 1074- 1078
-        strata: list | string, optional
+        step_size: float, optional
+            set an initial step size for the fitting algorithm.
+        strata: list or string, optional
             specify a column or list of columns n to use in stratification. This is useful if a
             categorical covariate does not obey the proportional hazard assumption. This
             is used similar to the `strata` expression in R.
@@ -149,11 +153,6 @@ class CoxTimeVaryingFitter(SemiParametricRegressionFitter, ProportionalHazardMix
             algorithm. Default is the zero vector.
         formula: str, optional
             A R-like formula for transforming the covariates
-        fit_options: dict, optional
-            Override the default values in NR algorithm:
-                step_size: 0.95,
-                precision: 1e-07,
-                max_steps: 500,
 
         Returns
         --------
@@ -161,7 +160,7 @@ class CoxTimeVaryingFitter(SemiParametricRegressionFitter, ProportionalHazardMix
             self, with additional properties like ``hazards_`` and ``print_summary``
 
         """
-        self.strata = utils._to_list_or_singleton(coalesce(strata, self.strata))
+        self.strata = coalesce(strata, self.strata)
         self.robust = robust
         if self.robust:
             raise NotImplementedError("Not available yet.")
@@ -212,7 +211,7 @@ class CoxTimeVaryingFitter(SemiParametricRegressionFitter, ProportionalHazardMix
         self._norm_mean = X.mean(0)
         self._norm_std = X.std(0)
 
-        beta_, self.log_likelihood_, self._hessian_ = self._newton_raphson_for_efron_model(
+        params_ = self._newton_rhaphson(
             normalize(X, self._norm_mean, self._norm_std),
             events,
             start,
@@ -220,17 +219,11 @@ class CoxTimeVaryingFitter(SemiParametricRegressionFitter, ProportionalHazardMix
             weights,
             initial_point=initial_point,
             show_progress=show_progress,
-            **utils.coalesce(fit_options, {}),
+            step_size=step_size,
         )
 
-        self.params_ = pd.Series(beta_, index=pd.Index(X.columns, name="covariate"), name="coef") / self._norm_std
-        if self._hessian_.size > 0:
-            # possible if the df is trivial (no covariate columns)
-            self.variance_matrix_ = pd.DataFrame(-inv(self._hessian_) / np.outer(self._norm_std, self._norm_std), index=X.columns)
-
-        else:
-            self.variance_matrix_ = pd.DataFrame(index=X.columns, columns=X.columns)
-
+        self.params_ = pd.Series(params_, index=pd.Index(X.columns, name="covariate"), name="coef") / self._norm_std
+        self.variance_matrix_ = pd.DataFrame(-inv(self._hessian_) / np.outer(self._norm_std, self._norm_std), index=X.columns)
         self.standard_errors_ = self._compute_standard_errors(
             normalize(X, self._norm_mean, self._norm_std), events, start, stop, weights
         )
@@ -319,7 +312,7 @@ class CoxTimeVaryingFitter(SemiParametricRegressionFitter, ProportionalHazardMix
             df["-log2(p)"] = -utils.quiet_log2(df["p"])
             return df
 
-    def _newton_raphson_for_efron_model(
+    def _newton_rhaphson(
         self,
         df,
         events,
@@ -329,7 +322,7 @@ class CoxTimeVaryingFitter(SemiParametricRegressionFitter, ProportionalHazardMix
         show_progress=False,
         step_size=0.95,
         precision=10e-6,
-        max_steps=50,
+        max_steps=500,
         initial_point=None,
     ):  # pylint: disable=too-many-arguments,too-many-locals,too-many-branches,too-many-statements
         """
@@ -358,7 +351,7 @@ class CoxTimeVaryingFitter(SemiParametricRegressionFitter, ProportionalHazardMix
         soft_abs = lambda x, a: 1 / a * (anp.logaddexp(0, -a * x) + anp.logaddexp(0, a * x))
         penalizer = (
             lambda beta, a: n
-            * (self.penalizer * (self.l1_ratio * (soft_abs(beta, a)) + 0.5 * (1 - self.l1_ratio) * (beta**2))).sum()
+            * (self.penalizer * (self.l1_ratio * (soft_abs(beta, a)) + 0.5 * (1 - self.l1_ratio) * (beta ** 2))).sum()
         )
         d_penalizer = elementwise_grad(penalizer)
         dd_penalizer = elementwise_grad(d_penalizer)
@@ -375,7 +368,6 @@ class CoxTimeVaryingFitter(SemiParametricRegressionFitter, ProportionalHazardMix
         converging = True
         ll, previous_ll = 0, 0
         start_time = time.time()
-
         step_sizer = StepSizer(step_size)
         step_size = step_sizer.next()
 
@@ -402,13 +394,13 @@ class CoxTimeVaryingFitter(SemiParametricRegressionFitter, ProportionalHazardMix
                 self._log_likelihood_null = ll
 
             if isinstance(self.penalizer, np.ndarray) or self.penalizer > 0:
-                ll -= penalizer(beta, 1.5**i)
-                g -= d_penalizer(beta, 1.5**i)
-                h[np.diag_indices(d)] -= dd_penalizer(beta, 1.5**i)
+                ll -= penalizer(beta, 1.5 ** i)
+                g -= d_penalizer(beta, 1.5 ** i)
+                h[np.diag_indices(d)] -= dd_penalizer(beta, 1.5 ** i)
 
             try:
                 # reusing a piece to make g * inv(h) * g.T faster later
-                inv_h_dot_g_T = spsolve(-h, g, assume_a="pos")
+                inv_h_dot_g_T = spsolve(-h, g, sym_pos=True)
             except ValueError as e:
                 if "infs or NaNs" in str(e):
                     raise ConvergenceError(
@@ -444,7 +436,8 @@ https://lifelines.readthedocs.io/en/latest/Examples.html#problems-with-convergen
             if show_progress:
                 print(
                     "\rIteration %d: norm_delta = %.5f, step_size = %.5f, ll = %.5f, newton_decrement = %.5f, seconds_since_start = %.1f"
-                    % (i, norm_delta, step_size, ll, newton_decrement, time.time() - start_time)
+                    % (i, norm_delta, step_size, ll, newton_decrement, time.time() - start_time),
+                    end="",
                 )
 
             # convergence criteria
@@ -473,6 +466,10 @@ See https://stats.stackexchange.com/questions/11109/how-to-deal-with-perfect-sep
 
             beta += delta
 
+        self._hessian_ = hessian
+        self._score_ = gradient
+        self.log_likelihood_ = ll
+
         if show_progress and completed:
             print("Convergence completed after %d iterations." % (i))
         elif show_progress and not completed:
@@ -488,7 +485,7 @@ See https://stats.stackexchange.com/questions/11109/how-to-deal-with-perfect-sep
         elif not completed:
             warnings.warn("Newton-Rhapson failed to converge sufficiently in %d steps." % max_steps, ConvergenceWarning)
 
-        return beta, ll, hessian
+        return beta
 
     @staticmethod
     def _get_gradients(X, events, start, stop, weights, beta):  # pylint: disable=too-many-locals
@@ -860,3 +857,127 @@ See https://stats.stackexchange.com/questions/11109/how-to-deal-with-perfect-sep
         else:
             se = np.sqrt(self.variance_matrix_.values.diagonal())
         return pd.Series(se, index=self.params_.index, name="se")
+
+
+    ##################3
+    ##################
+    def predict_cumulative_hazard(
+        self,
+        X: Union[Series, DataFrame],
+        times: Optional[Union[ndarray, List[float]]] = None,
+        conditional_after: Optional[List[int]] = None,
+    ) -> pd.DataFrame:
+        """
+        Parameters
+        ----------
+        X: numpy array or DataFrame
+            a (n,d) covariate numpy array or DataFrame. If a DataFrame, columns
+            can be in any order. If a numpy array, columns must be in the
+            same order as the training data.
+        times: iterable, optional
+            an iterable of increasing times to predict the cumulative hazard at. Default
+            is the set of all durations (observed and unobserved). Uses a linear interpolation if
+            points in time are not in the index.
+        conditional_after: iterable, optional
+            Must be equal is size to X.shape[0] (denoted ``n`` above).  An iterable (array, list, series) of possibly non-zero values that represent how long the
+            subject has already lived for. Ex: if :math:`T` is the unknown event time, then this represents :math:`s` in
+            :math:`T | T > s`. This is useful for knowing the *remaining* hazard/survival of censored subjects.
+            The new timeline is the remaining duration of the subject, i.e. reset back to starting at 0.
+        """
+        if isinstance(X, pd.Series):
+            return self.predict_cumulative_hazard(
+                X.to_frame().T.infer_objects(), times=times, conditional_after=conditional_after
+            )
+
+        n = X.shape[0]
+
+        if times is not None:
+            times = np.atleast_1d(times).astype(float)
+        else:
+            times = self.timeline
+        if conditional_after is not None:
+            conditional_after = utils._to_1d_array(conditional_after).reshape(n, 1)
+
+        if self.strata:
+            X = X.copy()
+            cumulative_hazard_ = pd.DataFrame()
+            if conditional_after is not None:
+                X["_conditional_after"] = conditional_after
+
+            for stratum, stratified_X in X.groupby(self.strata):
+                try:
+                    strata_c_0 = self.baseline_cumulative_hazard_[[stratum]]
+                except KeyError:
+                    raise exceptions.StatError(
+                        dedent(
+                            """The stratum %s was not found in the original training data. For example, try
+                            the following on the original dataset, df: `df.groupby(%s).size()`. Expected is that %s is not present in the output."""
+                            % (stratum, self.strata, stratum)
+                        )
+                    )
+                col = utils._get_index(stratified_X)
+                v = self.predict_partial_hazard(stratified_X)
+                times_ = times
+                n_ = stratified_X.shape[0]
+                if conditional_after is not None:
+                    conditional_after_ = stratified_X.pop("_conditional_after").values[:, None]
+                    times_to_evaluate_at = np.tile(times_, (n_, 1)) + conditional_after_
+
+                    c_0_ = utils.interpolate_at_times(strata_c_0, times_to_evaluate_at)
+                    c_0_conditional_after = utils.interpolate_at_times(strata_c_0, conditional_after_)
+                    c_0_ = np.clip((c_0_ - c_0_conditional_after).T, 0, np.inf)
+
+                else:
+                    times_to_evaluate_at = np.tile(times_, (n_, 1))
+                    c_0_ = utils.interpolate_at_times(strata_c_0, times_to_evaluate_at).T
+
+                cumulative_hazard_ = cumulative_hazard_.merge(
+                    pd.DataFrame(c_0_ * v.values, columns=col, index=times_), how="outer", right_index=True, left_index=True
+                )
+        else:
+
+            v = self.predict_partial_hazard(X)
+            col = utils._get_index(v)
+            times_ = times
+
+            if conditional_after is not None:
+                times_to_evaluate_at = np.tile(times_, (n, 1)) + conditional_after
+
+                c_0 = utils.interpolate_at_times(self.baseline_cumulative_hazard_, times_to_evaluate_at)
+                c_0_conditional_after = utils.interpolate_at_times(self.baseline_cumulative_hazard_, conditional_after)
+                c_0 = np.clip((c_0 - c_0_conditional_after).T, 0, np.inf)
+
+            else:
+                times_to_evaluate_at = np.tile(times_, (n, 1))
+                c_0 = utils.interpolate_at_times(self.baseline_cumulative_hazard_, times_to_evaluate_at).T
+
+            cumulative_hazard_ = pd.DataFrame(c_0 * v.values, columns=col, index=times_)
+
+        return cumulative_hazard_
+
+    def predict_survival_function(
+        self,
+        X: Union[Series, DataFrame],
+        times: Optional[Union[List[float], ndarray]] = None,
+        conditional_after: Optional[List[int]] = None,
+    ) -> pd.DataFrame:
+        """
+        Predict the survival function for individuals, given their covariates. This assumes that the individual
+        just entered the study (that is, we do not condition on how long they have already lived for.)
+        Parameters
+        ----------
+        X: numpy array or DataFrame
+            a (n,d) covariate numpy array or DataFrame. If a DataFrame, columns
+            can be in any order. If a numpy array, columns must be in the
+            same order as the training data.
+        times: iterable, optional
+            an iterable of increasing times to predict the cumulative hazard at. Default
+            is the set of all durations (observed and unobserved). Uses a linear interpolation if
+            points in time are not in the index.
+        conditional_after: iterable, optional
+            Must be equal is size to X.shape[0] (denoted ``n`` above).  An iterable (array, list, series) of possibly non-zero values that represent how long the
+            subject has already lived for. Ex: if :math:`T` is the unknown event time, then this represents :math:`s` in
+            :math:`T | T > s`. This is useful for knowing the *remaining* hazard/survival of censored subjects.
+            The new timeline is the remaining duration of the subject, i.e. normalized back to starting at 0.
+        """
+        return exp(-self.predict_cumulative_hazard(X, times=times, conditional_after=conditional_after))
